@@ -14,7 +14,7 @@ name: Release
 
 on:
   push:
-    branches: [main, arena/ed67e789-life-exe]
+    branches: [main]
   workflow_dispatch:
     inputs:
       publish:
@@ -395,8 +395,19 @@ jobs:
           url="https://${owner,,}.github.io/${repo}/"
 
           if [ "$code" = "200" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "::notice title=GitHub Pages::Already enabled — deploying to $url"
+            # deploy-pages only works when the site is built by a workflow.
+            # A "Deploy from a branch" site reports build_type=legacy.
+            build_type="$(tr -d ' \n' < "$RUNNER_TEMP/pages.json" \
+              | grep -o '"build_type":"[a-z]*"' | head -n 1 | cut -d'"' -f4)"
+            echo "build_type=${build_type:-unknown}"
+
+            if [ "$build_type" = "workflow" ]; then
+              echo "enabled=true" >> "$GITHUB_OUTPUT"
+              echo "::notice title=GitHub Pages::Enabled with the GitHub Actions source — deploying to $url"
+            else
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              echo "::warning title=GitHub Pages uses the wrong source::Pages is enabled but its source is '${build_type:-unknown}', not GitHub Actions, so this workflow cannot deploy to it. Change Settings -> Pages -> Build and deployment -> Source to 'GitHub Actions'. Releases and artifacts are unaffected."
+            fi
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "::warning title=GitHub Pages is not enabled::The web build cannot be deployed until it is. Enable it once: Settings -> Pages -> Build and deployment -> Source: GitHub Actions. Then re-run this workflow and the site appears at $url. Downloadable artifacts and releases are unaffected."
