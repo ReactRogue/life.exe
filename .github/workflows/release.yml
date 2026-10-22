@@ -14,7 +14,7 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    branches: [main, arena/ed67e789-life-exe]
   workflow_dispatch:
     inputs:
       publish:
@@ -361,6 +361,110 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # ------------------------------------------------------------------- pages
+  # The release attaches web.zip for self-hosting anywhere; this job also
+  # serves the same app live from GitHub Pages, so the web build has a URL
+  # you can open instead of a file you have to unzip.
+  #
+  # Pages is a static host, so the SPA needs three things the plain export
+  # does not give it:
+  #   * a base URL of /<repo>/, because project sites live under a subpath
+  #     while Metro emits root-absolute /_expo/... asset URLs
+  #   * .nojekyll, because Jekyll silently drops underscore-prefixed dirs
+  #   * 404.html, so deep links render the app instead of a 404 page
+  pages:
+    name: Deploy web app to GitHub Pages
+    needs: [meta, web]
+    if: >-
+      ${{
+        !cancelled() &&
+        needs.web.result == 'success'
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Export for a project subpath
+        run: |
+          set -euo pipefail
+          export EXPO_WEB_BASE_URL="/${GITHUB_REPOSITORY#*/}"
+          echo "Base URL: $EXPO_WEB_BASE_URL"
+          npx expo export --platform web --output-dir dist --clear
+
+      - name: Prepare static files
+        run: |
+          set -euo pipefail
+          touch dist/.nojekyll
+          cp dist/index.html dist/404.html
+          ls -a dist
+
+      - name: Configure Pages
+        id: pagescfg
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Smoke test the deployed site
+        run: |
+          emit() {
+            local line="${1:0:900}"
+            line="${line//%/%25}"
+            echo "::notice title=pages::${line}"
+          }
+
+          base="${{ steps.deploy.outputs.page_url }}"
+          base="${base%/}"
+          origin="$(printf '%s' "$base" | cut -d/ -f1-3)"
+          emit "page_url=$base"
+
+          root_code="$(curl -sS -o "$RUNNER_TEMP/root.html" -w '%{http_code}' "$base/" || echo 000)"
+          emit "root status=$root_code"
+          emit "title=$(grep -oE '<title>[^<]*</title>' "$RUNNER_TEMP/root.html" | head -n 1)"
+
+          asset="$(grep -oE '/[^"]*_expo/static/js/web/entry-[^"]*\.js' "$RUNNER_TEMP/root.html" | head -n 1 || true)"
+          emit "entry asset=${asset:-not-found}"
+
+          asset_code=000
+          if [ -n "$asset" ]; then
+            asset_code="$(curl -sS -o /dev/null -w '%{http_code}' "$origin$asset" || echo 000)"
+          fi
+          emit "asset status=$asset_code"
+
+          deep_code="$(curl -sS -o /dev/null -w '%{http_code}' "$base/quests" || echo 000)"
+          emit "deep link /quests status=$deep_code (404 is expected: SPA fallback serves the app)"
+
+          if [ "$root_code" != "200" ] || [ "$asset_code" != "200" ]; then
+            echo "::error::GitHub Pages is not serving the app correctly (root=$root_code asset=$asset_code)."
+            exit 1
+          fi
+
   # ----------------------------------------------------------------- release
   release:
     name: Publish GitHub Release
@@ -417,7 +521,13 @@ jobs:
           - **Web:** the app is local-first; progress is stored in the browser's `localStorage` for that origin.
           EOF
 
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
           {
+            echo ""
+            echo "### Play it in the browser"
+            echo ""
+            echo "**https://${owner,,}.github.io/${repo}/** — deployed by the Pages job, no download needed."
             echo ""
             echo "### Build metadata"
             echo ""
