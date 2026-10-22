@@ -134,6 +134,27 @@ jobs:
           cp "$apk" "out/${{ needs.meta.outputs.artifact_base }}-android.apk"
           ls -lh out
 
+      - name: Verify APK signature and version
+        run: |
+          emit() {
+            local line="${1:0:900}"
+            line="${line//%/%25}"
+            echo "::notice title=apk::${line}"
+          }
+          apk="$(ls out/*.apk | head -n 1)"
+          emit "artifact=$(basename "$apk") bytes=$(stat -c %s "$apk")"
+          bt="$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -n 1)"
+          emit "build-tools=$(basename "${bt:-none}")"
+          if [ -n "$bt" ] && [ -x "$bt/apksigner" ]; then
+            while IFS= read -r line; do emit "cert ${line}"; done < <("$bt/apksigner" verify --print-certs "$apk" 2>&1 | grep -E "Signer|SHA-256|DN:" | head -n 4)
+          fi
+          for tool in "$bt"/aapt "$bt"/aapt2; do
+            if [ -x "$tool" ]; then
+              while IFS= read -r line; do emit "badging ${line}"; done < <("$tool" dump badging "$apk" 2>/dev/null | head -n 2)
+              break
+            fi
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: android-apk
@@ -283,6 +304,21 @@ jobs:
           unzip -l "$GITHUB_WORKSPACE/$ipa" | head -n 12 || true
           ls -lh out
 
+      - name: Verify IPA metadata
+        run: |
+          emit() {
+            local line="${1:0:900}"
+            line="${line//%/%25}"
+            echo "::notice title=ipa::${line}"
+          }
+          plist="$(find "$RUNNER_TEMP/Payload" -maxdepth 2 -name Info.plist -print -quit)"
+          emit "ipa=$(ls -1 out/*.ipa | xargs -n1 basename)"
+          emit "app=$(basename "$(dirname "$plist")")"
+          for key in CFBundleIdentifier CFBundleShortVersionString CFBundleVersion; do
+            value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist" 2>/dev/null || echo "?")"
+            emit "${key}=${value}"
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: ios-ipa
@@ -399,6 +435,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
+          # Without this the tag is created on the default branch HEAD, which
+          # may be ahead of the commit that actually produced these binaries.
+          target_commitish: ${{ github.sha }}
           name: Life.exe ${{ needs.meta.outputs.tag }}
           body_path: release-notes.md
           files: release/*
