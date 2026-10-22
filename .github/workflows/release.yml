@@ -173,17 +173,42 @@ jobs:
         run: |
           set -euo pipefail
           workspace="$(ls -d *.xcworkspace | head -n 1)"
-          scheme="$(xcodebuild -list -workspace "$workspace" \
-            | awk '/Schemes:/{flag=1; next} flag && NF {print $1; exit}')"
+          project="$(ls -d *.xcodeproj | head -n 1)"
+          echo "workspace=$workspace"
+          echo "project=$project"
+
+          # Use the app's own shared scheme. `xcodebuild -list` also reports
+          # every CocoaPods target as a scheme (boost, EXConstants, ...), and
+          # building one of those compiles a static library and produces no
+          # .app at all.
+          scheme=""
+          for candidate in "$project"/xcshareddata/xcschemes/*.xcscheme; do
+            if [ -e "$candidate" ]; then
+              scheme="$(basename "$candidate" .xcscheme)"
+              break
+            fi
+          done
+
+          declared="$(xcodebuild -list -workspace "$workspace" 2>/dev/null \
+            | awk '/Schemes:/{found=1; next} found && NF {print $1}')"
+          echo "--- schemes reported by xcodebuild ---"
+          echo "$declared"
+
+          # Fall back to the first non-Pods scheme if the app has no shared one.
           if [ -z "$scheme" ]; then
-            echo "Could not detect an Xcode scheme" >&2
-            xcodebuild -list -workspace "$workspace" >&2
+            scheme="$(echo "$declared" | grep -vE '^(boost|Pods|React|RCT|EX[A-Z]|Yoga|glog|fmt|hermes|DoubleConversion|SocketRocket|RN[A-Z])' | head -n 1)"
+          fi
+
+          if [ -z "$scheme" ] || ! echo "$declared" | grep -qx "$scheme"; then
+            echo "::error::Could not resolve the application scheme (candidate='$scheme')."
             exit 1
           fi
-          echo "workspace=$workspace"
-          echo "scheme=$scheme"
-          echo "workspace=$workspace" >> "$GITHUB_OUTPUT"
-          echo "scheme=$scheme" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved scheme: $scheme"
+          {
+            echo "workspace=$workspace"
+            echo "scheme=$scheme"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build release app (code signing disabled)
         working-directory: ios
