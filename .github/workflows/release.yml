@@ -1,0 +1,358 @@
+name: Release
+
+# Builds a release APK, an unsigned release IPA, and the static web bundle,
+# then publishes them to a GitHub Release tagged from app.json.
+#
+# app.json is the single source of truth:
+#   expo.version            -> release tag (v1.2.3) and every artifact name
+#   expo.ios.buildNumber    -> CFBundleVersion in the IPA
+#   expo.android.versionCode-> versionCode in the APK
+#
+# Triggers:
+#   * push to main      -> build + publish automatically
+#   * manual dispatch   -> build (+ optional publish) from any branch
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub Release with the built artifacts
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CI: '1'
+  EXPO_NO_TELEMETRY: '1'
+
+jobs:
+  # ---------------------------------------------------------------- metadata
+  meta:
+    name: Resolve version from app.json
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.info.outputs.version }}
+      tag: ${{ steps.info.outputs.tag }}
+      artifact_base: ${{ steps.info.outputs.artifactBase }}
+      android_version_code: ${{ steps.info.outputs.androidVersionCode }}
+      ios_build_number: ${{ steps.info.outputs.iosBuildNumber }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: info
+        run: node scripts/app-info.mjs
+
+  # ------------------------------------------------------------ static checks
+  checks:
+    name: Typecheck and domain tests
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: TypeScript
+        run: npx tsc --noEmit
+      - name: Domain tests
+        run: npx vitest run
+
+  # ----------------------------------------------------------------- android
+  android:
+    name: Android release APK
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Optional: set these repository secrets to sign with your own upload
+      # keystore instead of the generated debug key.
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - run: npm ci
+
+      - name: Generate native project
+        run: npx expo prebuild --platform android --no-install --clean
+
+      - name: Configure signing
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/upload.keystore
+        run: |
+          set -euo pipefail
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
+            # Publish the path for the Gradle step below.
+            echo "ANDROID_KEYSTORE_PATH=$ANDROID_KEYSTORE_PATH" >> "$GITHUB_ENV"
+          fi
+          node scripts/patch-android-signing.mjs
+
+      - name: Build release APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Collect artifact
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # AGP names this app-release.apk unless the build is unsigned.
+          apk="$(find android/app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | head -n 1)"
+          if [ -z "$apk" ]; then
+            echo "No APK produced:" >&2
+            find android/app/build/outputs -type f >&2 || true
+            exit 1
+          fi
+          echo "Found $apk"
+          if command -v apksigner >/dev/null 2>&1; then
+            apksigner verify --print-certs "$apk" || echo "apksigner verification reported an issue"
+          fi
+          cp "$apk" "out/${{ needs.meta.outputs.artifact_base }}-android.apk"
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  # --------------------------------------------------------------------- ios
+  ios:
+    name: iOS release IPA (unsigned)
+    needs: meta
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generate native project
+        run: npx expo prebuild --platform ios --no-install --clean
+
+      - name: Install CocoaPods
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          pod --version
+          pod install
+
+      - name: Resolve scheme and workspace
+        id: project
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          workspace="$(ls -d *.xcworkspace | head -n 1)"
+          scheme="$(xcodebuild -list -workspace "$workspace" \
+            | awk '/Schemes:/{flag=1; next} flag && NF {print $1; exit}')"
+          if [ -z "$scheme" ]; then
+            echo "Could not detect an Xcode scheme" >&2
+            xcodebuild -list -workspace "$workspace" >&2
+            exit 1
+          fi
+          echo "workspace=$workspace"
+          echo "scheme=$scheme"
+          echo "workspace=$workspace" >> "$GITHUB_OUTPUT"
+          echo "scheme=$scheme" >> "$GITHUB_OUTPUT"
+
+      - name: Archive (code signing disabled)
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -workspace "${{ steps.project.outputs.workspace }}" \
+            -scheme "${{ steps.project.outputs.scheme }}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          app="$(find "$RUNNER_TEMP/App.xcarchive/Products/Applications" -maxdepth 1 -name '*.app' | head -n 1)"
+          if [ -z "$app" ]; then
+            echo "No .app product found in the archive" >&2
+            find "$RUNNER_TEMP/App.xcarchive" -maxdepth 3 >&2
+            exit 1
+          fi
+          echo "Packaging $(basename "$app")"
+          mkdir -p "$RUNNER_TEMP/Payload" out
+          cp -R "$app" "$RUNNER_TEMP/Payload/"
+          (cd "$RUNNER_TEMP" && zip -qry "$GITHUB_WORKSPACE/out/${{ needs.meta.outputs.artifact_base }}-ios-unsigned.ipa" Payload)
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: out/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+  # --------------------------------------------------------------------- web
+  web:
+    name: Static web build
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Export web bundle
+        run: npx expo export --platform web --output-dir dist --clear
+
+      - name: Package web bundle
+        run: |
+          set -euo pipefail
+          test -f dist/index.html
+          mkdir -p out
+          (cd dist && zip -qr "$GITHUB_WORKSPACE/out/${{ needs.meta.outputs.artifact_base }}-web.zip" .)
+          du -sh dist
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: out/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  # ----------------------------------------------------------------- release
+  release:
+    name: Publish GitHub Release
+    needs: [meta, checks, android, ios, web]
+    if: >-
+      ${{
+        !cancelled() &&
+        needs.checks.result == 'success' &&
+        needs.android.result == 'success' &&
+        needs.ios.result == 'success' &&
+        needs.web.result == 'success' &&
+        (github.event_name != 'workflow_dispatch' || inputs.publish)
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          path: release
+
+      - name: Flatten and checksum
+        run: |
+          set -euo pipefail
+          find release -mindepth 2 -type f -exec mv -f {} release/ \;
+          find release -mindepth 1 -depth -type d -exec rm -rf {} +
+          (cd release && sha256sum * > SHA256SUMS.txt)
+          ls -lh release
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<'EOF'
+          Life.exe — a local-first life RPG. Quests, XP, skill trees, streaks, achievements, and a cosmetic vault.
+
+          Everything below is built from this repository at the tagged commit. `app.json` is the source of truth for the version, so the tag always matches `expo.version`.
+
+          ### Downloads
+
+          | File | What it is |
+          | --- | --- |
+          | `-android.apk` | Release APK. Signed with the debug key by default, so it installs on any device with "install unknown apps" enabled. Set the Android keystore secrets to ship a store-signed build instead. |
+          | `-ios-unsigned.ipa` | Release IPA that is **not code signed**. Sideload it with AltStore, Sideloadly, or your own signing identity. App Store/TestFlight distribution needs an Apple Developer certificate and provisioning profile. |
+          | `-web.zip` | Static web build (`expo export`). Unzip and serve from any static host, or open `index.html` over a local server. |
+          | `SHA256SUMS.txt` | Checksums for every asset. |
+
+          ### Install notes
+
+          - **Android:** transfer the APK, tap it, allow installs from this source. It runs standalone (no Expo Go, no Metro).
+          - **iOS:** unsigned IPAs cannot be installed directly by iOS. Use AltStore/Sideloadly, or build with your own signing certificate.
+          - **Web:** the app is local-first; progress is stored in the browser's `localStorage` for that origin.
+          EOF
+
+          {
+            echo ""
+            echo "### Build metadata"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| version | \`${{ needs.meta.outputs.version }}\` |"
+            echo "| tag | \`${{ needs.meta.outputs.tag }}\` |"
+            echo "| android versionCode | \`${{ needs.meta.outputs.android_version_code }}\` |"
+            echo "| ios buildNumber | \`${{ needs.meta.outputs.ios_build_number }}\` |"
+            echo "| commit | \`${{ github.sha }}\` |"
+            echo "| workflow run | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+          } >> release-notes.md
+          cat release-notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: Life.exe ${{ needs.meta.outputs.tag }}
+          body_path: release-notes.md
+          files: release/*
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+          make_latest: 'true'
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          {
+            echo "## Released ${{ needs.meta.outputs.tag }}"
+            echo ""
+            echo "Artifacts attached to the release:"
+            echo ""
+            ls -lh release | tail -n +2 | awk '{print "- `" $9 "` — " $5}'
+            echo ""
+            echo "Release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.meta.outputs.tag }}"
+          } >> "$GITHUB_STEP_SUMMARY"

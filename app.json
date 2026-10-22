@@ -15,10 +15,12 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "app.lifeexe.os"
+      "bundleIdentifier": "app.lifeexe.os",
+      "buildNumber": "1"
     },
     "android": {
       "package": "app.lifeexe.os",
+      "versionCode": 1,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#060A12"

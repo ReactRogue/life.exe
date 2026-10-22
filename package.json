@@ -11,7 +11,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "export:web": "expo export --platform web"
+    "export:web": "expo export --platform web",
+    "release:info": "node scripts/app-info.mjs",
+    "release:bump": "node scripts/bump-version.mjs"
   },
   "dependencies": {
     "@expo-google-fonts/chakra-petch": "^0.4.1",
