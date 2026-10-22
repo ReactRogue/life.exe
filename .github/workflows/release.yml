@@ -361,6 +361,180 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # ------------------------------------------------------------ pages preflight
+  # GitHub Pages has to be switched on once in the repository settings. That is
+  # an admin-level setting: GITHUB_TOKEN gets `pages: write`, which can deploy
+  # to an existing site but cannot create one ("Resource not accessible by
+  # integration"). So check first and tell the user precisely what to click,
+  # instead of failing the whole run.
+  pages-check:
+    name: Check GitHub Pages is enabled
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - name: Probe the Pages site
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          code="$(curl -sS -o "$RUNNER_TEMP/pages.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages" || echo 000)"
+          echo "GET /repos/${GITHUB_REPOSITORY}/pages -> $code"
+
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          url="https://${owner,,}.github.io/${repo}/"
+
+          if [ "$code" = "200" ]; then
+            # deploy-pages only works when the site is built by a workflow.
+            # A "Deploy from a branch" site reports build_type=legacy.
+            build_type="$(tr -d ' \n' < "$RUNNER_TEMP/pages.json" \
+              | grep -o '"build_type":"[a-z]*"' | head -n 1 | cut -d'"' -f4)"
+            echo "build_type=${build_type:-unknown}"
+
+            if [ "$build_type" = "workflow" ]; then
+              echo "enabled=true" >> "$GITHUB_OUTPUT"
+              echo "::notice title=GitHub Pages::Enabled with the GitHub Actions source — deploying to $url"
+            else
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              echo "::warning title=GitHub Pages uses the wrong source::Pages is enabled but its source is '${build_type:-unknown}', not GitHub Actions, so this workflow cannot deploy to it. Change Settings -> Pages -> Build and deployment -> Source to 'GitHub Actions'. Releases and artifacts are unaffected."
+            fi
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=GitHub Pages is not enabled::The web build cannot be deployed until it is. Enable it once: Settings -> Pages -> Build and deployment -> Source: GitHub Actions. Then re-run this workflow and the site appears at $url. Downloadable artifacts and releases are unaffected."
+          fi
+
+  # ------------------------------------------------------------------- pages
+  # The release attaches web.zip for self-hosting anywhere; this job also
+  # serves the same app live from GitHub Pages, so the web build has a URL
+  # you can open instead of a file you have to unzip.
+  #
+  # Pages is a static host, so the SPA needs three things the plain export
+  # does not give it:
+  #   * a base URL of /<repo>/, because project sites live under a subpath
+  #     while Metro emits root-absolute /_expo/... asset URLs
+  #   * .nojekyll, because Jekyll silently drops underscore-prefixed dirs
+  #   * 404.html, so deep links render the app instead of a 404 page
+  pages:
+    name: Deploy web app to GitHub Pages
+    needs: [meta, web, pages-check]
+    if: >-
+      ${{
+        !cancelled() &&
+        needs.web.result == 'success' &&
+        needs.pages-check.outputs.enabled == 'true' &&
+        (github.event_name != 'push' || github.ref == 'refs/heads/main')
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Export for a project subpath
+        run: |
+          set -euo pipefail
+          export EXPO_WEB_BASE_URL="/${GITHUB_REPOSITORY#*/}"
+          echo "Base URL: $EXPO_WEB_BASE_URL"
+          npx expo export --platform web --output-dir dist --clear
+
+      - name: Prepare static files
+        run: |
+          set -euo pipefail
+          touch dist/.nojekyll
+          cp dist/index.html dist/404.html
+          ls -a dist
+
+      - name: Configure Pages
+        id: pagescfg
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Smoke test the deployed site
+        run: |
+          emit() {
+            local line="${1:0:900}"
+            line="${line//%/%25}"
+            echo "::notice title=pages::${line}"
+          }
+
+          # Pages can take a moment to propagate, so retry before failing.
+          fetch() {
+            local url="$1" out="$2" code="000"
+            for _ in $(seq 1 12); do
+              code="$(curl -sS -o "$out" -w '%{http_code}' "$url" 2>/dev/null || echo 000)"
+              if [ "$code" = "200" ]; then
+                echo 200
+                return 0
+              fi
+              sleep 5
+            done
+            echo "$code"
+            return 1
+          }
+
+          base="${{ steps.deploy.outputs.page_url }}"
+          base="${base%/}"
+          origin="$(printf '%s' "$base" | cut -d/ -f1-3)"
+          emit "page_url=$base"
+
+          root_code="$(fetch "$base/" "$RUNNER_TEMP/root.html" || true)"
+          emit "root status=$root_code"
+          emit "title=$(grep -oE '<title>[^<]*</title>' "$RUNNER_TEMP/root.html" | head -n 1)"
+
+          asset="$(grep -oE '/[^"]*_expo/static/js/web/entry-[^"]*\.js' "$RUNNER_TEMP/root.html" | head -n 1 || true)"
+          emit "entry asset=${asset:-not-found}"
+
+          asset_code=000
+          if [ -n "$asset" ]; then
+            asset_code="$(fetch "$origin$asset" /dev/null || true)"
+          fi
+          emit "asset status=$asset_code"
+
+          deep_code="$(curl -sS -o /dev/null -w '%{http_code}' "$base/quests" 2>/dev/null || echo 000)"
+          emit "deep link /quests status=$deep_code (404 is expected: the SPA fallback serves the app shell)"
+
+          if [ "$root_code" != "200" ] || [ "$asset_code" != "200" ]; then
+            echo "::error title=Pages smoke test failed::root=$root_code entry-asset=$asset_code for $base"
+            exit 1
+          fi
+          emit "smoke test passed"
+
   # ----------------------------------------------------------------- release
   release:
     name: Publish GitHub Release
@@ -417,7 +591,13 @@ jobs:
           - **Web:** the app is local-first; progress is stored in the browser's `localStorage` for that origin.
           EOF
 
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
           {
+            echo ""
+            echo "### Play it in the browser"
+            echo ""
+            echo "**https://${owner,,}.github.io/${repo}/** — deployed by the Pages job, no download needed."
             echo ""
             echo "### Build metadata"
             echo ""

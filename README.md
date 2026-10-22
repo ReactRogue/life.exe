@@ -71,3 +71,27 @@ automatically:
 
 Actions → **Release** → *Run workflow*. The `publish` input controls whether a GitHub
 Release is created; leave it off to just build and download the artifacts from the run.
+
+## Live web app (GitHub Pages)
+
+Every release run also deploys the web build to GitHub Pages:
+
+**https://reactrogue.github.io/life.exe/**
+
+That is a real URL you can open — no unzipping. A few things make it work on a
+static host, all handled by the `pages` job:
+
+- **Subpath assets.** Project sites live at `/<repo>/`, but Metro emits
+  root-absolute `/_expo/...` URLs. `app.config.js` applies
+  `experiments.baseUrl = /<repo>` when `EXPO_WEB_BASE_URL` is set, which is only
+  during the Pages export. Local dev and the release `web.zip` stay at `/`.
+- **`.nojekyll`.** Jekyll deletes underscore-prefixed directories, which would
+  wipe the whole `_expo` asset tree.
+- **`404.html`.** The app is a single-page bundle, so unknown paths get the app
+  shell and client-side routing takes over instead of a GitHub 404.
+
+The job fails if the deployed site does not return `200` for both `index.html`
+and the entry JS bundle, so a broken deploy cannot pass silently.
+
+Note: the `web.zip` release asset is the root-path build, meant for hosting at a
+domain root (Netlify, Vercel, S3, or your own server).
