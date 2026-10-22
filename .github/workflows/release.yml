@@ -206,16 +206,36 @@ jobs:
       - name: Package unsigned IPA
         run: |
           set -euo pipefail
-          app="$(find "$RUNNER_TEMP/App.xcarchive/Products/Applications" -maxdepth 1 -name '*.app' | head -n 1)"
+          mkdir -p out
+          # The product normally lands in the archive, but targets built with
+          # SKIP_INSTALL land in DerivedData instead. Accept either.
+          app=""
+          for root in \
+            "$RUNNER_TEMP/App.xcarchive/Products/Applications" \
+            "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos"; do
+            [ -d "$root" ] || continue
+            candidate="$(find "$root" -maxdepth 1 -name '*.app' -print -quit)"
+            if [ -n "$candidate" ]; then
+              app="$candidate"
+              break
+            fi
+          done
           if [ -z "$app" ]; then
-            echo "No .app product found in the archive" >&2
-            find "$RUNNER_TEMP/App.xcarchive" -maxdepth 3 >&2
+            echo "::error::No .app product was produced by the archive."
+            echo "--- archive tree ---"
+            find "$RUNNER_TEMP/App.xcarchive" -maxdepth 4 || true
+            echo "--- derived data products ---"
+            find "$RUNNER_TEMP/DerivedData/Build/Products" -maxdepth 3 || true
             exit 1
           fi
           echo "Packaging $(basename "$app")"
-          mkdir -p "$RUNNER_TEMP/Payload" out
+          rm -rf "$RUNNER_TEMP/Payload"
+          mkdir -p "$RUNNER_TEMP/Payload"
           cp -R "$app" "$RUNNER_TEMP/Payload/"
-          (cd "$RUNNER_TEMP" && zip -qry "$GITHUB_WORKSPACE/out/${{ needs.meta.outputs.artifact_base }}-ios-unsigned.ipa" Payload)
+          ipa="out/${{ needs.meta.outputs.artifact_base }}-ios-unsigned.ipa"
+          (cd "$RUNNER_TEMP" && zip -qry "$GITHUB_WORKSPACE/$ipa" Payload)
+          echo "--- IPA contents (head) ---"
+          unzip -l "$GITHUB_WORKSPACE/$ipa" | head -n 20
           ls -lh out
 
       - uses: actions/upload-artifact@v4
