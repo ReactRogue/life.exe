@@ -361,6 +361,47 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # ------------------------------------------------------------ pages preflight
+  # GitHub Pages has to be switched on once in the repository settings. That is
+  # an admin-level setting: GITHUB_TOKEN gets `pages: write`, which can deploy
+  # to an existing site but cannot create one ("Resource not accessible by
+  # integration"). So check first and tell the user precisely what to click,
+  # instead of failing the whole run.
+  pages-check:
+    name: Check GitHub Pages is enabled
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - name: Probe the Pages site
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          code="$(curl -sS -o "$RUNNER_TEMP/pages.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages" || echo 000)"
+          echo "GET /repos/${GITHUB_REPOSITORY}/pages -> $code"
+
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          url="https://${owner,,}.github.io/${repo}/"
+
+          if [ "$code" = "200" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=GitHub Pages::Already enabled — deploying to $url"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=GitHub Pages is not enabled::The web build cannot be deployed until it is. Enable it once: Settings -> Pages -> Build and deployment -> Source: GitHub Actions. Then re-run this workflow and the site appears at $url. Downloadable artifacts and releases are unaffected."
+          fi
+
   # ------------------------------------------------------------------- pages
   # The release attaches web.zip for self-hosting anywhere; this job also
   # serves the same app live from GitHub Pages, so the web build has a URL
@@ -374,11 +415,13 @@ jobs:
   #   * 404.html, so deep links render the app instead of a 404 page
   pages:
     name: Deploy web app to GitHub Pages
-    needs: [meta, web]
+    needs: [meta, web, pages-check]
     if: >-
       ${{
         !cancelled() &&
-        needs.web.result == 'success'
+        needs.web.result == 'success' &&
+        needs.pages-check.outputs.enabled == 'true' &&
+        (github.event_name != 'push' || github.ref == 'refs/heads/main')
       }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -439,12 +482,27 @@ jobs:
             echo "::notice title=pages::${line}"
           }
 
+          # Pages can take a moment to propagate, so retry before failing.
+          fetch() {
+            local url="$1" out="$2" code="000"
+            for _ in $(seq 1 12); do
+              code="$(curl -sS -o "$out" -w '%{http_code}' "$url" 2>/dev/null || echo 000)"
+              if [ "$code" = "200" ]; then
+                echo 200
+                return 0
+              fi
+              sleep 5
+            done
+            echo "$code"
+            return 1
+          }
+
           base="${{ steps.deploy.outputs.page_url }}"
           base="${base%/}"
           origin="$(printf '%s' "$base" | cut -d/ -f1-3)"
           emit "page_url=$base"
 
-          root_code="$(curl -sS -o "$RUNNER_TEMP/root.html" -w '%{http_code}' "$base/" || echo 000)"
+          root_code="$(fetch "$base/" "$RUNNER_TEMP/root.html" || true)"
           emit "root status=$root_code"
           emit "title=$(grep -oE '<title>[^<]*</title>' "$RUNNER_TEMP/root.html" | head -n 1)"
 
@@ -453,17 +511,18 @@ jobs:
 
           asset_code=000
           if [ -n "$asset" ]; then
-            asset_code="$(curl -sS -o /dev/null -w '%{http_code}' "$origin$asset" || echo 000)"
+            asset_code="$(fetch "$origin$asset" /dev/null || true)"
           fi
           emit "asset status=$asset_code"
 
-          deep_code="$(curl -sS -o /dev/null -w '%{http_code}' "$base/quests" || echo 000)"
-          emit "deep link /quests status=$deep_code (404 is expected: SPA fallback serves the app)"
+          deep_code="$(curl -sS -o /dev/null -w '%{http_code}' "$base/quests" 2>/dev/null || echo 000)"
+          emit "deep link /quests status=$deep_code (404 is expected: the SPA fallback serves the app shell)"
 
           if [ "$root_code" != "200" ] || [ "$asset_code" != "200" ]; then
-            echo "::error::GitHub Pages is not serving the app correctly (root=$root_code asset=$asset_code)."
+            echo "::error title=Pages smoke test failed::root=$root_code entry-asset=$asset_code for $base"
             exit 1
           fi
+          emit "smoke test passed"
 
   # ----------------------------------------------------------------- release
   release:
