@@ -14,7 +14,7 @@ name: Release
 
 on:
   push:
-    branches: [main, arena/c1676ea0-life-exe]
+    branches: [main]
   workflow_dispatch:
     inputs:
       publish:
@@ -27,7 +27,7 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CI: '1'
@@ -372,6 +372,7 @@ jobs:
         needs.android.result == 'success' &&
         needs.ios.result == 'success' &&
         needs.web.result == 'success' &&
+        (github.event_name != 'push' || github.ref == 'refs/heads/main') &&
         (github.event_name != 'workflow_dispatch' || inputs.publish)
       }}
     runs-on: ubuntu-latest
