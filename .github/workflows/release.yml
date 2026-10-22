@@ -185,86 +185,77 @@ jobs:
           echo "workspace=$workspace" >> "$GITHUB_OUTPUT"
           echo "scheme=$scheme" >> "$GITHUB_OUTPUT"
 
-      - name: Archive (code signing disabled)
+      - name: Build release app (code signing disabled)
         working-directory: ios
         run: |
-          set -euo pipefail
-          xcodebuild archive \
+          emit() {
+            local line="${1:0:900}"
+            line="${line//%/%25}"
+            echo "::notice title=ios-build::${line}"
+          }
+          emit "workspace=${{ steps.project.outputs.workspace }} scheme=${{ steps.project.outputs.scheme }}"
+
+          log="$RUNNER_TEMP/xcodebuild.log"
+          set +e
+          xcodebuild build \
             -workspace "${{ steps.project.outputs.workspace }}" \
             -scheme "${{ steps.project.outputs.scheme }}" \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
-            -archivePath "$RUNNER_TEMP/App.xcarchive" \
             -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             EXPANDED_CODE_SIGN_IDENTITY="" \
-            ENABLE_USER_SCRIPT_SANDBOXING=NO
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            > "$log" 2>&1
+          status=$?
+          set -e
+
+          emit "xcodebuild exited $status after $SECONDS s"
+          emit "log lines: $(wc -l < "$log")"
+          if [ "$status" -ne 0 ]; then
+            while IFS= read -r line; do emit "ERR ${line}"; done < <(grep -E "(error|fatal error):" "$log" | head -n 5)
+            while IFS= read -r line; do emit "TAIL ${line}"; done < <(grep -v '^[[:space:]]*$' "$log" | tail -n 4)
+          else
+            while IFS= read -r line; do emit "TAIL ${line}"; done < <(grep -v '^[[:space:]]*$' "$log" | tail -n 3)
+          fi
+          exit "$status"
 
       - name: Package unsigned IPA
         run: |
-          set -euo pipefail
-          mkdir -p out
-
           emit() {
             local line="${1:0:900}"
             line="${line//%/%25}"
-            echo "::notice title=xcode-layout::${line}"
+            echo "::notice title=ios-ipa::${line}"
           }
 
-          app=""
-          for root in \
-            "$RUNNER_TEMP/App.xcarchive/Products/Applications" \
-            "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos" \
-            "$GITHUB_WORKSPACE/ios/build/Build/Products/Release-iphoneos"; do
-            if [ ! -d "$root" ]; then
-              continue
-            fi
-            candidate="$(find "$root" -maxdepth 2 -type d -name '*.app' -print -quit 2>/dev/null || true)"
-            if [ -n "$candidate" ]; then
-              app="$candidate"
-              break
-            fi
-          done
+          mkdir -p out
+          products="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos"
+          emit "products dir: $(ls -1 "$products" 2>/dev/null | tr '\n' ' ')"
 
-          # Last resort: scan the build areas for any app bundle.
+          app=""
+          if [ -d "$products" ]; then
+            app="$(find "$products" -maxdepth 1 -type d -name '*.app' -print -quit 2>/dev/null || true)"
+          fi
           if [ -z "$app" ]; then
-            app="$(find "$RUNNER_TEMP" "$GITHUB_WORKSPACE/ios" -type d -name '*.app' \
+            app="$(find "$RUNNER_TEMP/DerivedData" "$GITHUB_WORKSPACE/ios" -type d -name '*.app' \
               -not -path '*/Pods/*' -print -quit 2>/dev/null || true)"
           fi
-
           if [ -z "$app" ]; then
-            echo "::error::No .app product was produced by the archive."
-            while IFS= read -r line; do
-              emit "$line"
-            done < <(
-              {
-                echo "--- RUNNER_TEMP ---"
-                ls -la "$RUNNER_TEMP" 2>/dev/null || true
-                echo "--- archives ---"
-                find "$RUNNER_TEMP" -maxdepth 2 -name '*.xcarchive' 2>/dev/null || true
-                echo "--- archive tree ---"
-                find "$RUNNER_TEMP/App.xcarchive" -maxdepth 4 2>/dev/null || true
-                echo "--- derived products ---"
-                find "$RUNNER_TEMP/DerivedData/Build/Products" -maxdepth 2 2>/dev/null || true
-                echo "--- workspace ios/build ---"
-                find "$GITHUB_WORKSPACE/ios/build" -maxdepth 3 2>/dev/null || true
-              } | head -n 30
-            )
+            emit "no .app under $products"
+            while IFS= read -r line; do emit "TREE ${line}"; done < <(find "$RUNNER_TEMP/DerivedData/Build/Products" -maxdepth 2 2>/dev/null | head -n 5)
             exit 1
           fi
 
-          emit "product: $app"
-          echo "Packaging $(basename "$app")"
+          emit "packaging $(basename "$app")"
           rm -rf "$RUNNER_TEMP/Payload"
           mkdir -p "$RUNNER_TEMP/Payload"
           cp -R "$app" "$RUNNER_TEMP/Payload/"
           ipa="out/${{ needs.meta.outputs.artifact_base }}-ios-unsigned.ipa"
           (cd "$RUNNER_TEMP" && zip -qry "$GITHUB_WORKSPACE/$ipa" Payload)
-          echo "--- IPA contents (head) ---"
-          unzip -l "$GITHUB_WORKSPACE/$ipa" | head -n 20 || true
+          unzip -l "$GITHUB_WORKSPACE/$ipa" | head -n 12 || true
           ls -lh out
 
       - uses: actions/upload-artifact@v4
