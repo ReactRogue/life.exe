@@ -27,7 +27,7 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref_name }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   CI: '1'
@@ -207,27 +207,56 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          # The product normally lands in the archive, but targets built with
-          # SKIP_INSTALL land in DerivedData instead. Accept either.
+
+          emit() {
+            local line="${1:0:900}"
+            line="${line//%/%25}"
+            echo "::notice title=xcode-layout::${line}"
+          }
+
           app=""
           for root in \
             "$RUNNER_TEMP/App.xcarchive/Products/Applications" \
-            "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos"; do
-            [ -d "$root" ] || continue
-            candidate="$(find "$root" -maxdepth 1 -name '*.app' -print -quit)"
+            "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos" \
+            "$GITHUB_WORKSPACE/ios/build/Build/Products/Release-iphoneos"; do
+            if [ ! -d "$root" ]; then
+              continue
+            fi
+            candidate="$(find "$root" -maxdepth 2 -type d -name '*.app' -print -quit 2>/dev/null || true)"
             if [ -n "$candidate" ]; then
               app="$candidate"
               break
             fi
           done
+
+          # Last resort: scan the build areas for any app bundle.
+          if [ -z "$app" ]; then
+            app="$(find "$RUNNER_TEMP" "$GITHUB_WORKSPACE/ios" -type d -name '*.app' \
+              -not -path '*/Pods/*' -print -quit 2>/dev/null || true)"
+          fi
+
           if [ -z "$app" ]; then
             echo "::error::No .app product was produced by the archive."
-            echo "--- archive tree ---"
-            find "$RUNNER_TEMP/App.xcarchive" -maxdepth 4 || true
-            echo "--- derived data products ---"
-            find "$RUNNER_TEMP/DerivedData/Build/Products" -maxdepth 3 || true
+            while IFS= read -r line; do
+              emit "$line"
+            done < <(
+              {
+                echo "--- RUNNER_TEMP ---"
+                ls -la "$RUNNER_TEMP" 2>/dev/null || true
+                echo "--- archives ---"
+                find "$RUNNER_TEMP" -maxdepth 2 -name '*.xcarchive' 2>/dev/null || true
+                echo "--- archive tree ---"
+                find "$RUNNER_TEMP/App.xcarchive" -maxdepth 4 2>/dev/null || true
+                echo "--- derived products ---"
+                find "$RUNNER_TEMP/DerivedData/Build/Products" -maxdepth 2 2>/dev/null || true
+                echo "--- workspace ios/build ---"
+                find "$GITHUB_WORKSPACE/ios/build" -maxdepth 3 2>/dev/null || true
+              } | head -n 30
+            )
             exit 1
           fi
+
+          emit "product: $app"
           echo "Packaging $(basename "$app")"
           rm -rf "$RUNNER_TEMP/Payload"
           mkdir -p "$RUNNER_TEMP/Payload"
@@ -235,7 +264,7 @@ jobs:
           ipa="out/${{ needs.meta.outputs.artifact_base }}-ios-unsigned.ipa"
           (cd "$RUNNER_TEMP" && zip -qry "$GITHUB_WORKSPACE/$ipa" Payload)
           echo "--- IPA contents (head) ---"
-          unzip -l "$GITHUB_WORKSPACE/$ipa" | head -n 20
+          unzip -l "$GITHUB_WORKSPACE/$ipa" | head -n 20 || true
           ls -lh out
 
       - uses: actions/upload-artifact@v4
